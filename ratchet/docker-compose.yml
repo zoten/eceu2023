@@ -1,0 +1,51 @@
+version: "3.7"
+
+services:
+
+  ratchet0:
+    image: "ratchet:latest"
+    environment:
+      RELEASE_NODE: ratchet@ratchet0
+      RELEASE_DISTRIBUTION: sname
+      SECRET_KEY_BASE: somesupersecretbasethatisatleast64bytesohcomeonIshouldhaveletPhoenixgenerateoneformeright?
+      RELEASE_COOKIE: supersecretcookie
+      PHX_HOST: ratchet0.io
+      PORT: 4000
+      BEAM_PORT_MIN: 4800
+      BEAM_PORT_MAX: 4810
+    ports:
+      - "4000:4000"
+      - "4369"
+      - "4800-4810"
+    restart: "always"
+    networks:
+      eceu:
+        ipv4_address: 10.5.12.2
+
+  ratchet1:
+    image: "ratchet:latest"
+    environment:
+      RELEASE_NODE: ratchet@ratchet1
+      RELEASE_DISTRIBUTION: sname
+      SECRET_KEY_BASE: somesupersecretbasethatisatleast64bytesohcomeonIshouldhaveletPhoenixgenerateoneformeright?
+      RELEASE_COOKIE: supersecretcookie
+      PHX_HOST: ratchet1.io
+      PORT: 4001
+      BEAM_PORT_MIN: 4800
+      BEAM_PORT_MAX: 4810
+    ports:
+      - "4001:4001"
+      - "4369"
+      - "4800-4810"
+    restart: "always"
+    networks:
+      eceu:
+        ipv4_address: 10.5.12.3
+
+networks:
+  eceu:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.5.12.0/16
+          gateway: 10.5.12.1

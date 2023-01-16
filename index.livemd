@@ -1,0 +1,997 @@
+# Remote Debugging with Livebook
+
+```elixir
+Mix.install([
+  {:cluster_connect_smartcell, "~> 0.0.3"},
+  {:vega_lite, "~> 0.1.7"},
+  {:kino_vega_lite, "~> 0.1.8"},
+  # Forked to include SVG header into code, not requiring assets
+  {:eflambe, git: "https://github.com/zoten/eflambe", ref: "master", override: true},
+  {:eflambe_live, git: "https://github.com/zoten/eflambe_live", ref: "master"},
+  {:httpoison, "~> 2.0"},
+  {:jason, "~> 1.4"}
+])
+
+alias VegaLite, as: Vl
+
+:ok
+```
+
+## Disclaimer
+
+Part of this notebook could have been set up using direct node connection from LiveBook. However, this would have prevented us to use `Mix.install` goodies, since starting in the context of the remote application would have teleported us in a non-mix context.
+
+![](images/dory-where-am-i.jpg)
+
+Something will be clunkier at the beginning, but we will benefit from it later, hopefully! 🤞
+
+## Setup
+
+A basic gotcha of the whole experience is that the `host` part of the `sname` **must** be resolved through the system's resolution system. In our case, since our hostnames will contain the `ratchet` word, let's test it (Linux specific):
+
+```elixir
+"/etc/hosts"
+|> File.read!()
+|> String.split("\n")
+|> Enum.filter(&String.contains?(&1, "ratchet"))
+|> Enum.join("\n")
+|> IO.puts()
+```
+
+If everything is ok, after cell execution you should see two lines above. We'd also like to check that the container(s) are running.
+
+```elixir
+2 =
+  "docker"
+  |> System.cmd(["ps"])
+  |> (fn {out, 0} -> String.split(out, "\n") end).()
+  |> Enum.filter(&String.contains?(&1, "ratchet"))
+  |> Enum.count()
+```
+
+Ok, we should have our instance(s) of the application running under docker.
+
+Lastly, let's set up some basic global configuration for the livebook
+
+```elixir
+# The main target node we will work on
+target_node = :ratchet@ratchet0
+# Fast reference list of known application nodes
+target_nodes = [
+  :ratchet@ratchet0,
+  :ratchet@ratchet1
+]
+
+cookie = :supersecretcookie
+api_endpoint = "http://ratchet0:4000/api"
+:ok
+```
+
+## Basic Connection
+
+A basic way to connect to a remote node from a shell/livebook is using one between `:net_kernel.connect_node/1` or `:net_adm.ping/1`
+
+```elixir
+:erlang.set_cookie(cookie)
+:net_kernel.connect_node(target_node) |> IO.inspect(label: :connect_node)
+Node.connect(target_node) |> IO.inspect(label: :node_connect)
+:net_adm.ping(target_node) |> IO.inspect(label: :ping)
+:erlang.disconnect_node(target_node)
+:ok
+```
+
+Now we can use the `:erpc` module to execute remote calls to our target node (`:erpc` contains a subset of the `:rpc` module, but it is an enhanced version, and `:rpc` itself uses `:erpc` when possible)
+
+```elixir
+Node.self() |> IO.inspect(label: :node)
+# :erpc itself makes a connection
+# Node.self() | :erlang.node()
+:erpc.call(target_node, Node, :self, []) |> IO.inspect(label: :erpc)
+```
+
+## Preparation
+
+Let's set up a small utility module to call an API endpoint and parse the result, so we'll have less noise in our output
+
+```elixir
+defmodule Api do
+  def get!(endpoint) do
+    case HTTPoison.get(endpoint) do
+      {:ok, %{status_code: 200, body: body}} ->
+        {:ok, Jason.decode!(body)}
+
+      result ->
+        IO.inspect(result, label: :error)
+        :error
+    end
+  end
+
+  def post!(endpoint, data \\ "") do
+    case HTTPoison.post(endpoint, data) do
+      {:ok, %{status_code: 200}} ->
+        :ok
+
+      result ->
+        IO.inspect(result, label: :error)
+        :error
+    end
+  end
+end
+
+:ok
+```
+
+So, we have our servers up, and we can check they also are in a cluster given that they expose a nice endpoint!
+
+```elixir
+Api.get!(api_endpoint <> "/node")
+```
+
+## Let's debug!
+
+We suspect (and our customer care confirms!) there is an endpoint that is causing troubles in our application: people are reaching out to `api/fibonacci` but they seem to wait way too much for their result. And they are paying for it!
+
+Let's see:
+
+```elixir
+Api.get!(api_endpoint <> "/fibonacci?n=5")
+```
+
+Uhm, that seems ok 🤔. Let's retry with a greater number?
+
+```elixir
+Api.get!(api_endpoint <> "/fibonacci?n=55")
+```
+
+Well, that's sad. Our SLA says that they should be able to get to
+
+$$
+  fib(55) = 139583862445
+$$
+
+in less than 5 seconds!
+But how can we understand where's the problem?
+
+## :dbg
+
+Our first friend will be [:dbg](https://www.erlang.org/doc/man/dbg.html) , from the good ol' batteries included with the BEAM. It is maybe the second most basic tool in our set, after `:erlang.trace/3` which we will not cover today, but `:dbg` uses it under the hood.
+
+> ⚠️ **Disclaimer**: tracing live nodes is not easy. Tracing too many things will make your node clunky. Tracing a function used by your tracers will deadlock. Deciding what to trace is a science driven by anger and coffee (or tea, or tears).
+
+A typical `:dbg` session may look like:
+
+```mermaid
+journey
+    title :dbg workflow
+    section Setup
+      stop dbg: 7
+      start dbg: 7
+    section Configure
+      trace port: 7
+      tracer: 7
+      nodes: 7
+      trace patterns: 7
+    section Make some noise!
+      application flows: 7
+    section Read
+      trace client: 7
+```
+
+Luckily, in our case, we remember a recent ticket on substituting our old clunky `old_fibonacci/1` function call with a brand new `tail_fibonacci/1`. Has it been merged before shipping?
+
+<!-- livebook:{"break_markdown":true} -->
+
+Let's stop any `:dbg` process in the remote machine before starting!
+
+> Self promotion time! I'm working spare-time on this cute smart cell to connect and optionally execute commands in remote nodes for the same use case we'll see in this livebook :)
+
+<!-- livebook:{"attrs":{"arguments":"[]","bind_result":"remote_dbg_pid","erlang_cookie":"","erlang_cookie_bound":"supersecretcookie","function":"stop","module":":dbg","target_node":"","target_node_bound":"ratchet@ratchet0"},"chunks":null,"kind":"Elixir.ClusterConnectSmartcell","livebook_object":"smart_cell"} -->
+
+```elixir
+remote_dbg_pid =
+  with {:cookie, true} <- {:cookie, :erlang.set_cookie(:supersecretcookie)},
+       {:connect, true} <- {:connect, :ratchet@ratchet0 |> :net_kernel.connect_node()},
+       {:monitor, :ok} <- {:monitor, :net_kernel.monitor_nodes(true)},
+       nodes <- Node.list(:connected),
+       {:command, {:ok, result}} <-
+         {:command,
+          ClusterConnectSmartcell.do_execute_remote_command(
+            :ratchet@ratchet0,
+            ":dbg",
+            "stop",
+            "[]"
+          )} do
+    %{"result" => result, "nodes" => nodes}
+  else
+    {step, res} when step in [:cookie, :connect, :command, :monitor] ->
+      %{"outcome" => false} |> Map.put(Atom.to_string(step), res)
+
+    error ->
+      %{"outcome" => false, "error" => error}
+  end
+```
+
+```elixir
+# :dbg.start()
+:erpc.call(target_node, :dbg, :start, []) |> IO.inspect(label: :dbg_start)
+```
+
+Now, we'll start what is called a `trace port` for handling trace messages without passing from
+BEAM messaging, thus remaining low profile.
+
+> ⚠️ **Remember:** tracing *is not free*, performance wise!
+
+Also, note that the port is created on the *remote* node. Tracing a remote pid on a local port is not allowed and would return `:cant_trace_remote_pid_to_local_port`.
+
+The result is a function that returns a port, suitable to be passed to `:dbg.tracer/2`
+A *file* port and an *IP* port are implemented in the BEAM
+
+```elixir
+# :dbg.trace_port(:file, 'traces')
+remote_port =
+  :erpc.call(target_node, :dbg, :trace_port, [
+    :file,
+    'traces'
+  ])
+```
+
+### Note: Port configuration
+
+We passed a single file name parameter here, but we could have chosen more complex rules (remember, traces can be huge!). For example, a configuration like
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+{'traces-', :wrap, Atom.to_charlist(target_node), 50_000_000, 12}
+```
+
+would have meant "use a file named `traces-ratchet@ratchet0<file_number>`, change file and increment `file_number` after `50MB` and keep a maximum of 12 files, `wrap`ping around the old ones (see the [Documentation](https://www.erlang.org/doc/man/dbg.html#trace_port-2)) for more info).
+
+> ⚠️ **Remember:** tracing *is not free*, space wise!
+
+<!-- livebook:{"break_markdown":true} -->
+
+Let's now start a `tracer` on the remote node using the remote port
+
+```elixir
+# Friendly :dbg already supports remote nodes
+:dbg.tracer(target_node, :port, remote_port)
+```
+
+Now we're ready to start tracing. `:dbg.p/2` can trace multiple or specific processes, ports, filtering messages received and sent, limiting tracing to existing items and a lot more. All the flags are of course [documented](https://www.erlang.org/doc/man/dbg.html#p-1) and you should as always be careful on what you trace, but for now we'll pick up a coin with a crane by tracing all global function calls (but at least not messages) in all processes and ports in the remote system.
+
+```elixir
+:dbg.p(:all, [:c])
+```
+
+We can now check if our alleged function is called: let's create what is called a `trace pattern`. A trace pattern is a set of `{{Module, Function, Arity}, MatchSpec}` that enable `:dbg` to understand if a function call has to be traced. `MatchSpec` can be used to further narrow down the set of calls to consider in the trace.
+
+Conveniently, Erlang comes with some built-in match specs, allowing us not to use the entire talk to describe what a [match spec](https://www.erlang.org/doc/apps/erts/match_spec.html) is (but remember that we have a `:dbg.fun2ms/1` helper!):
+
+* **exception_trace (:x)** -> sets a trace which will show function names, parameters, return values and exceptions thrown from functions
+* **caller_trace (:c)** -> display function names, parameters and information about which function called it
+* **caller_exception_trace (:cx)** -> combine goodies from both
+* `[]` -> not really a built-in, simply a catchall
+
+We'll kinda cheat here and enable tracing for both global and local calls using `:dbg.tpl/4` instead of `:dbg.tp/4`, just to avoid some `:erpc`
+
+```elixir
+{:ok, _} = :dbg.tpl(Ratchet.Math.Fibonacci, :old_fibonacci, 1, [])
+```
+
+Done! We should see a single matched function.
+
+Let's generate some noise now!
+
+```elixir
+# ⚠️ of course in production on destructive APIs the pattern would have been slightly different!
+Enum.each(1..100, fn _ -> Api.get!(api_endpoint <> "/fibonacci?n=5") end)
+```
+
+If we take a look at what is inside the `traces` file now on the remote node, we can see that it should have been populated.
+
+```elixir
+# File.read!("traces")
+:erpc.call(target_node, File, :read!, ["traces"])
+```
+
+To read this binary file (to be fair, for a simple match like this a `cat` should have shown readable characters), we'll create on the remote node what is called a `tracer client`: a process (with a handler function) that takes messages from a port and interprets them.
+
+If we used the default tracer (without ports), `:dbg.dhandler/2` would have been used as reporter. However, this function only prints to stdout.
+
+```elixir
+initial_data = :ok
+
+handler_fun = fn
+  :end_of_trace, _ ->
+    :ok
+
+  {:trace, _pid, :call, mfa_tuple}, _state ->
+    File.write!("traces_translated", "called #{inspect(mfa_tuple)}", [:append])
+    :ok
+
+  _ignore, _state ->
+    :ok
+end
+
+# :dbg.trace_client(:file, 'traces', {handler_fun, initial_data})
+:erpc.call(target_node, :dbg, :trace_client, [
+  :file,
+  'traces',
+  {handler_fun, initial_data}
+])
+
+:ok
+```
+
+Ugh, that's an error, isn't it? And that's totally understandable, since we created a local function `handler_fun/2`, but we passed a reference to our remote node.
+
+Of course, since we're simply performing commands in a remote procedure call fashion, we could still drop to a `iex --remsh` remote shell session, copy-paste the definitions in the local application context and directly spawn a
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+:dbg.trace_client(:file, 'traces', {handler_fun, initial_data})
+```
+
+We can achieve a similar result, although horrible to witness, by leveraging the evaluation capabilities of the BEAM
+
+```elixir
+content = """
+initial_data = :ok
+
+handler_fun = fn
+  :end_of_trace, _ ->
+    :ok
+  {:trace, _pid, :call, mfa_tuple}, _state ->
+    File.write!("traces_translated", "called \#{inspect(mfa_tuple)}\n", [:append])
+    :ok
+  _ignore, _state ->
+    :ok
+end
+
+:dbg.trace_client(:file, 'traces', {handler_fun, initial_data})
+"""
+
+# Code.eval_string(content)
+{trace_client_pid, _} = :erpc.call(target_node, Code, :eval_string, [content])
+```
+
+> ⚠️ An alternative option would have been using the `:ip` port, and spawning a remote port that sends packets to a local tracer, but we are in a production environment and opening ports other than the distribution one could not be an option.
+
+<!-- livebook:{"break_markdown":true} -->
+
+Now a file called `traces_translated` should have been created. Let's see!
+
+```elixir
+# File.read!("traces_translated")
+:erpc.call(target_node, File, :read!, ["traces_translated"])
+```
+
+```elixir
+:dbg.flush_trace_port(node())
+:dbg.flush_trace_port(target_node)
+
+:dbg.stop_clear()
+# :dbg.stop_clear()
+:erpc.call(target_node, :dbg, :stop_clear, []) |> IO.inspect(label: :stop_clear)
+```
+
+## Baby Steps
+
+This has been a long first step into debugging a trivial use case. Moreover, we couldn't benefit from LiveBook as greatly as I promised (well, if we forget of course:
+
+* a versionable, configurable and collaborative playbook
+* a pretty nice UI/UX for managing results
+* `Mix` availability to mix (pun unintended) local and remote goodies
+* some boilerplate smartcell helpers
+
+)
+
+Of course we could already get something more, even when just investigating, for example with a snippet like
+
+```elixir
+{numbers, timings} =
+  Enum.reduce_while(
+    1..100,
+    {[], 0},
+    # Let's check for the first input that takes more than 2 seconds to be answered
+    fn
+      n, {nums, last_time} when last_time <= 2_000_000 ->
+        {t0, _result} = :timer.tc(fn -> Api.get!(api_endpoint <> "/fibonacci?n=#{n}") end)
+        {:cont, {[{n, t0} | nums], t0}}
+
+      _n, {nums, _last_time} = _acc ->
+        {:halt, nums}
+    end
+  )
+  |> Enum.unzip()
+
+:ok
+```
+
+```elixir
+Vl.new()
+|> Vl.data_from_values(numbers: numbers, timings: timings)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "numbers", type: :quantitative)
+|> Vl.encode_field(:y, "timings", type: :quantitative)
+```
+
+we could have found when an API call started to be problematic in a comfortable visual way.
+
+<!-- livebook:{"break_markdown":true} -->
+
+The BEAM comes with a full integrated suite of tracing tools with different aims:
+
+* [dyntrace](http://erlang.org/doc/man/dyntrace.html) - Contributed module that provides an interface for dynamic tracing using external tools like dtrace.
+* [erl_tracer](http://erlang.org/doc/man/erl_tracer.html) - Erlang tracer behavior that you can implement in your own modules.
+* [et](http://erlang.org/doc/man/et.html) (Event Tracer) Used for recording arbitrary events. Can generate a sequence from the recorded events.
+* [seq_trace](http://erlang.org/doc/man/seq_trace.html) - Module for tracing information flowing between processes via message passing.
+* [ttb](http://erlang.org/doc/man/ttb.html) (Trace Tool Builder). Helps build traces for distributed systems. Relies on dbg and provides some nice shortcuts for starting traces and running them on distributed systems.
+
+## Interlude: solving the problem
+
+![](images/solve-problems.jpg)
+
+Before making another step in the magical world of software introspection, let's see how to mitigate the impact of our production bug. The team has been alerted, the build pipeline has started but customers are leaving our platform like devs after Friday's deploy.
+
+We know the *immutable images guild* will be mad at us, but to save the day we need to solve the issue in production ***now***.
+
+We know where the problem is. We know how to solve it. Let's do it.
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+defmodule Ratchet.Math.Fibonacci do
+  @moduledoc """
+  Some implementations of the Fibonacci famous serie
+  """
+
+  # TODO: swap this function with a better one!
+  @spec nth_fibonacci_number(n :: non_neg_integer()) :: non_neg_integer()
+  def nth_fibonacci_number(n), do: old_fibonacci(n)
+
+  @spec old_fibonacci(non_neg_integer()) :: pos_integer()
+  def old_fibonacci(0), do: 0
+  def old_fibonacci(1), do: 1
+  def old_fibonacci(n), do: old_fibonacci(n - 1) + old_fibonacci(n - 2)
+
+  @spec tail_fibonacci(non_neg_integer()) :: list(pos_integer())
+  def tail_fibonacci(0), do: 0
+  def tail_fibonacci(n), do: do_tail_fibonacci([1, 1], n)
+  defp do_tail_fibonacci(list, 2), do: Enum.reverse(list)
+
+  defp do_tail_fibonacci(list, n) do
+    [first, second | _] = list
+    do_tail_fibonacci([first + second | list], n - 1)
+  end
+end
+```
+
+So, we copy-pasted the module from the codebase and it seems pretty simple. Being good developers we created a really clean pure one, without dependencies. We simply forgot to switch a function, right? Let's do it right now.
+
+```elixir
+{:module, module_name, module_bin, _} =
+  defmodule Ratchet.Math.Fibonacci do
+    @moduledoc """
+    Some implementations of the Fibonacci famous serie
+    """
+
+    @spec nth_fibonacci_number(n :: non_neg_integer()) :: non_neg_integer()
+    def nth_fibonacci_number(n), do: tail_fibonacci(n)
+
+    @spec old_fibonacci(non_neg_integer()) :: pos_integer()
+    def old_fibonacci(0), do: 0
+    def old_fibonacci(1), do: 1
+    def old_fibonacci(n), do: old_fibonacci(n - 1) + old_fibonacci(n - 2)
+
+    @spec tail_fibonacci(non_neg_integer()) :: list(pos_integer())
+    def tail_fibonacci(0), do: 0
+    def tail_fibonacci(n), do: do_tail_fibonacci([1, 1], n)
+    defp do_tail_fibonacci([last_number | _rest], 2), do: last_number
+
+    defp do_tail_fibonacci(list, n) do
+      [first, second | _] = list
+      do_tail_fibonacci([first + second | list], n - 1)
+    end
+  end
+```
+
+We could have removed the old, faulty one, but who knows if any other point in the code is using it? We're already playing with fire 🔥
+
+As you can see, we have now the binary of the module. And we have a connection to the node itself, haven't we?
+
+```elixir
+# This path will be ignored now ¯\_(ツ)_/¯
+rpc_filename = "/app/lib/ratchet-0.1.0/ebin/#{module_name}.beam" |> String.to_charlist()
+
+# :code.load_library
+{:module, ^module_name} =
+  :erpc.call(target_node, :code, :load_binary, [module_name, rpc_filename, module_bin])
+```
+
+Is this it? Let's try again with our faulty API call.
+
+```elixir
+Api.get!(api_endpoint <> "/fibonacci?n=55")
+```
+
+That should have been evaluated faster, or at this moment the presentation will be really awkward.
+
+Unluckily, if we restart the application, this fix will be lost. However, the solution is in this case as simple as
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# wrap in our usual :erpc call
+File.write!("/app/lib/ratchet-0.1.0/ebin/#{module_name}.beam", module_bin)
+```
+
+However we won't perform this now, since I'd like to explore another use case. Let's restart.
+
+```elixir
+Api.post!(api_endpoint <> "/restart")
+```
+
+```elixir
+Api.get!(api_endpoint <> "/fibonacci?n=5") |> IO.inspect(label: :fast)
+Api.get!(api_endpoint <> "/fibonacci?n=55") |> IO.inspect(label: :slow)
+:ok
+```
+
+Ok, our code is slow again. Let's see another scenario!
+
+## This is Fire
+
+![](images/this-is-fire.jpeg)
+
+We talked about a simple scenario until now, where the execution flow was linear. However, what if our API call was the result of different actions?
+
+```elixir
+Api.get!(api_endpoint <> "/number-info?n=5")
+```
+
+There could have been API calls involved, nested functions and a lot of the business-as-usual we are used to. We may know that _flamegraphs_ are a good helper in those cases, do we? They allow us to see an execution span from both a vertical (nested calls) and horizontal (time) dimensions.
+
+![](images/datadog-flamegraph.avif)
+
+We'll drop to a useful library by Stratus3D called [eflambe](https://github.com/Stratus3D/eflambe) to generate traces that we can render as a flamegraph.
+
+However, since we do not have it in our production system...you already guessed it, right? We're gonna load it!
+
+First time I had to perform this action I manually loaded the needed modules, one at a time, in an iterative trial-and-error fashion until I got the subset of modules needed for the execution of `:eflambe.apply/2`. Luckily, because `eflambe` is an application and RTF<small>(ancy)</small>M, the BEAM gives us `:application.get_key/2`.
+
+```elixir
+{:ok, eflambe_modules} = :application.get_key(:eflambe, :modules)
+
+for module_name <- eflambe_modules do
+  {_module, module_bin, _filename} = :code.get_object_code(module_name)
+  rpc_filename = "/app/lib/eflambe-0.3.1/ebin/#{module_name}.beam" |> String.to_charlist()
+
+  # :code.load_binary(module_name, rpc_filename, module_bin)
+  {:module, ^module_name} =
+    :erpc.call(target_node, :code, :load_binary, [module_name, rpc_filename, module_bin])
+end
+```
+
+All we need to do now is to start the `eflambe` application and `apply` our function.
+
+In a real case scenario, of course, we could have chosen to use the `:eflambe.capture` fashion, to capture function calls without explicitly disturbing the system.
+
+> ⚠️ Because I wanted an svg, I had to explicitly enable the `:xmerl` application in the mix file of the service. This may not apply for `:brendan_gregg` output format
+
+> ⚠️ Also because I wanted an svg **and** I wanted to generate it in the remote node, I used a [modified fork](https://github.com/zoten/eflambe) of `:eflambe` that embeds a non-code asset (the `svg header`), just to simplify the flow
+
+```elixir
+# Start the application
+# :eflambe_app.start(:temporary, [])
+:erpc.call(
+  target_node,
+  :eflambe_app,
+  :start,
+  [:temporary, []]
+)
+
+# Here we use some knowledge about the endpoint using Ratchet.get_number_info/1,
+# otherwise we should have forged an HTTP request to the controller
+# or fallback to `:eflambe.capture`
+
+# :eflambe.apply({Ratchet, :get_number_info, [11]}, output_format: :svg, return: :flamegraph)
+svg =
+  :erpc.call(
+    target_node,
+    :eflambe,
+    :apply,
+    [
+      {
+        Ratchet,
+        :get_number_info,
+        [
+          11
+        ]
+      },
+      [
+        output_format: :svg,
+        return: :flamegraph
+      ]
+    ]
+  )
+```
+
+When I started imagining this talk I had in mind writing a smartcell looting visualizers like [Brendan Gregg](https://github.com/brendangregg/FlameGraph), [speedscope](https://github.com/jlfwong/speedscope) or other tools.
+
+Then, [SpawnFest 2022](https://spawnfest.org/2022.html) took place, and Stratus3D made the gorgeous [EFlambé Live](https://github.com/spawnfest/eflambe_live) , allowing me not to withdraw my proposal (or using an external program/docker image) for having overestimated my abilities.
+
+Let's then use it!
+
+```elixir
+# Detail from eflambe_live source
+svg
+|> IO.iodata_to_binary()
+|> EflambeLive.FlameGraph.new()
+```
+
+## Bonus: sequential tracing with :seq_trace
+
+We refer as _Sequential tracing_ the act of following a sequence of information. Erlang comes with [:seq_trace](https://www.erlang.org/doc/man/seq_trace.html) as a specific helper module for the task.
+
+Tracing in Erlang works by setting a `token` on the first process that starts a trace. That `token` will be propagated to each process that receives information (via messaging or other means).
+
+> 🚀 performance impact of sequential tracing is usually negligible
+
+The usage is straightforward:
+
+* you start a `tracer` process that will collect information
+* you set some flags (using `:seq_trace.set_token/2`)
+* you set your `tracer` process as **the** system tracer (using `:seq_trace.set_system_tracer/1`)
+* let the system make some noise 🚀
+* you stop the trace and get information
+
+### Context
+
+Our test application has another way to ask for a Fibonacci number: asking Emperor Frederick 2, who hosted John of Palermo, who proposed problems to Leonardo Bonacci. However, those people message themselves through different nodes! Let's see how with `:seq_trace`
+
+[Caveat](https://www.erlang.org/doc/man/seq_trace.html#sequential-tracing):
+
+> ⚠️ To get the whole picture of a sequential trace, involving processes on many Erlang nodes, the output from the system tracer on each involved node must be merged (offline)
+
+We'll fallback then on the same trick we already use: load arbitrary code on the nodes
+
+```elixir
+{:module, module_name, module_bin, _} =
+  defmodule Tracer do
+    @moduledoc """
+    This module is ready to be set as system tracer. It already filters out some
+    of IO and Livebook's messaging
+    """
+
+    use GenServer
+
+    # @actions [:send, :receive]
+    @actions [:send]
+
+    def start_link do
+      GenServer.start_link(__MODULE__, nil, name: Tracer)
+    end
+
+    def start do
+      GenServer.start(__MODULE__, nil, name: Tracer)
+    end
+
+    def get_trace_events(tracer \\ Tracer) do
+      GenServer.call(tracer, :get_trace_events)
+    end
+
+    @impl true
+    def init(_) do
+      {:ok, %{node: node(), events: [], ignored: []}}
+    end
+
+    @impl true
+    def handle_call(:get_trace_events, _from, %{events: trace_events} = state) do
+      {:reply, {:ok, Enum.reverse(trace_events)}, state}
+    end
+
+    @impl true
+    def handle_info(
+          {:seq_trace, _label, {action, serial, from, to, message}, timestamp},
+          state
+        )
+        when action in @actions do
+      new_state = handle_seq_trace({action, serial, from, to, message}, timestamp, state)
+
+      {:noreply, new_state}
+    end
+
+    @impl true
+    def handle_info(
+          {:seq_trace, _label, {action, serial, from, to, message} = _msg},
+          state
+        )
+        when action in @actions do
+      new_state = handle_seq_trace({action, serial, from, to, message}, nil, state)
+
+      {:noreply, new_state}
+    end
+
+    def handle_info(ignored_event, %{ignored: ignored} = state) do
+      # ignore! printing stuff here would yield a nice deadlock
+      {:noreply, %{state | ignored: [ignored_event | ignored]}}
+    end
+
+    @ignored_events [
+      :io_request,
+      :io_reply,
+      :spawn_request,
+      :spawn_reply,
+      :get_file,
+      :put_chars
+    ]
+
+    defp maybe_ignore(%{message: {action, _, _}}, events) when action in @ignored_events,
+      do: events
+
+    defp maybe_ignore(%{message: {:error, :enoent}}, events), do: events
+    defp maybe_ignore(%{message: {:code_server, {:error, :nofile}}}, events), do: events
+    defp maybe_ignore(%{message: {_pid, {:error, :enoent}}}, events), do: events
+    defp maybe_ignore(%{message: {:runtime_memory_usage, _info}}, events), do: events
+    defp maybe_ignore(%{message: {_pid, {:get_file, _}}}, events), do: events
+
+    defp maybe_ignore(%{message: {:code_call, _pid, {:ensure_loaded, _module}}}, events),
+      do: events
+
+    defp maybe_ignore(%{message: {:evaluation_finished, _}}, events), do: events
+    defp maybe_ignore(%{message: {:runtime_evaluation_output, _, _}}, events), do: events
+    defp maybe_ignore(%{message: {:runtime_evaluation_response, _, _, _}}, events), do: events
+
+    defp maybe_ignore(%{message: _message} = payload, events) do
+      # IO.inspect(payload, label: :matched)
+      [payload | events]
+    end
+
+    defp handle_seq_trace(
+           {action, _serial, from, to, message},
+           timestamp,
+           %{events: trace_events, node: thisnode} = state
+         ) do
+      payload = %{
+        node: thisnode,
+        node_to: pid_node(to),
+        timestamp: timestamp,
+        from: from,
+        to: to,
+        message: message,
+        action: action
+      }
+
+      new_events = maybe_ignore(payload, trace_events)
+
+      %{state | events: new_events}
+    end
+
+    defp pid_node({_module, other_node}), do: other_node
+    defp pid_node(pid), do: node(pid)
+  end
+```
+
+Let's load the code on both nodes this time!
+
+```elixir
+rpc_filename = "/app/lib/ratchet-0.1.0/ebin/#{module_name}.beam" |> String.to_charlist()
+
+target_nodes
+|> Enum.map(fn nodename ->
+  :net_adm.ping(nodename)
+
+  # :code.load_binary(module_name, rpc_filename, module_bin)
+  {:module, ^module_name} =
+    :erpc.call(nodename, :code, :load_binary, [module_name, rpc_filename, module_bin])
+end)
+
+:ok
+```
+
+```elixir
+defmodule Setup do
+  @moduledoc """
+  This module simply gets the code to setup a tracer using Tracer
+  """
+
+  def code() do
+    """
+    if GenServer.whereis(Tracer) != nil do
+      GenServer.stop(Tracer)
+    end
+
+    {:ok, tpid} = Tracer.start()
+    # :seq_trace.set_token(:label, :mytracerlabel)
+    :seq_trace.set_token(:send, true)
+    :seq_trace.set_token(:receive, true)
+    :seq_trace.set_token(:strict_monotonic_timestamp, true)
+    :seq_trace.set_system_tracer(tpid)
+    tpid
+    """
+  end
+end
+
+# Setup.code() |> Code.eval_string()
+{tpid0, _bindings0} =
+  :erpc.call(:ratchet@ratchet0, Code, :eval_string, [Setup.code()]) |> IO.inspect()
+
+# Setup.code() |> Code.eval_string()
+{tpid1, _bindings1} =
+  :erpc.call(:ratchet@ratchet1, Code, :eval_string, [Setup.code()]) |> IO.inspect()
+
+{tpid0, tpid1}
+```
+
+```elixir
+if GenServer.whereis(Tracer) != nil do
+  GenServer.stop(Tracer)
+end
+
+{:ok, tpid} = Tracer.start_link()
+:seq_trace.set_token(:send, true)
+:seq_trace.set_token(:receive, true)
+:seq_trace.set_token(:strict_monotonic_timestamp, true)
+:seq_trace.set_system_tracer(tpid)
+tpid
+```
+
+```elixir
+GenServer.call(
+  {Ratchet.People.EmperorFrederick2, :ratchet@ratchet0},
+  {:ask, :emperor_frederick_2, 5}
+)
+```
+
+```elixir
+# |> IO.inspect()
+{:ok, local_events} = Tracer.get_trace_events()
+# |> IO.inspect(label: :events0)
+{:ok, events0} = GenServer.call({Tracer, :ratchet@ratchet0}, :get_trace_events)
+# |> IO.inspect(label: :events1)
+{:ok, events1} = GenServer.call({Tracer, :ratchet@ratchet1}, :get_trace_events)
+
+events =
+  local_events
+  |> Enum.concat(events0)
+  |> Enum.concat(events1)
+```
+
+```elixir
+defmodule Sequencer do
+  @moduledoc """
+  Takes a trace result and visualizes it
+  """
+
+  alias Kino.Mermaid
+
+  def analyze(events) do
+    sorted_events =
+      events
+      |> Enum.filter(&interesting_event?/1)
+      |> Enum.sort_by(fn
+        # strict_monotonic_timestamp case
+        %{timestamp: {_timestamp, unique_integer}} -> unique_integer
+        # monotonic_timestamp case
+        %{timestamp: timestamp} -> timestamp
+      end)
+      |> Enum.map(fn evt ->
+        # IO.inspect([evt.node, evt.node_to, evt.timestamp])
+        evt
+      end)
+
+    {nodes_participants_lookup, nodes_participants_list} =
+      sorted_events
+      |> nodes_participants()
+
+    nodes_participants =
+      nodes_participants_list
+      |> mermaid_nodes()
+
+    messages = mermaid_messages(sorted_events, nodes_participants_lookup)
+
+    Mermaid.new("""
+    sequenceDiagram
+    #{nodes_participants}
+    #{messages}
+    """)
+  end
+
+  # Get all pids that appear in the flow, in order of appearance
+  defp nodes_participants(sorted_events) do
+    nodes_participants_lookup =
+      Enum.reduce(
+        sorted_events,
+        {%{}, 0},
+        fn %{node: from, node_to: to}, {_lookup, _order_of_appearance} = acc ->
+          acc
+          |> maybe_add_participant(from)
+          |> maybe_add_participant(to)
+        end
+      )
+      |> (fn {lookup, _} -> lookup end).()
+
+    nodes_participants_list =
+      nodes_participants_lookup
+      |> Enum.into([])
+      |> Enum.sort_by(fn {_node_name, order_of_appearance} -> order_of_appearance end)
+
+    {nodes_participants_lookup, nodes_participants_list}
+  end
+
+  def maybe_add_participant({lookup, order_of_appearance}, pid) do
+    if Map.has_key?(lookup, pid) do
+      {lookup, order_of_appearance}
+    else
+      {
+        Map.put(lookup, pid, order_of_appearance),
+        order_of_appearance + 1
+      }
+    end
+  end
+
+  # livebook messages
+  defp interesting_event?(%{to: {:logger_proxy, _}}), do: false
+  # the tracer call to get events
+  defp interesting_event?(%{to: {Tracer, _other_node}}), do: false
+  defp interesting_event?(%{to: {_module, other_node}}), do: other_node != node()
+
+  # only inter-node communications
+  # defp interesting_event?(%{from: from, to: to}) do
+  #  node_from = node(from)
+  #  node_to = node(to)
+
+  #  node_from != node_to
+  # end
+
+  # loopback messages
+  # defp interesting_event?(%{from: loopback, to: loopback}), do: false
+  defp interesting_event?(_), do: false
+
+  # Mermaid stuff
+
+  defp mermaid_messages(events, lookup) do
+    events
+    |> Enum.map_join("\n", fn event -> mermaid_message(event, lookup) end)
+  end
+
+  # Format a send event
+  defp mermaid_message(
+         %{from: _from, node: node_from, to: _to, node_to: node_to, message: message},
+         lookup
+       ) do
+    formatted_message = label_from_message(message)
+    from_idx = lookup[node_from]
+    to_idx = lookup[node_to]
+
+    "#{from_idx}->>#{to_idx}: #{formatted_message}"
+  end
+
+  defp label_from_message(message) do
+    case message do
+      {:"$gen_call", _ref, value} -> "CALL: #{inspect(value)}"
+      value -> "???: #{inspect(value)}"
+    end
+  end
+
+  # Generate the Mermaid formatted list of nodes
+  defp mermaid_nodes(nodes) do
+    nodes
+    |> Enum.map_join("\n", fn {the_node, idx} ->
+      if the_node == node() do
+        "participant #{idx} AS LiveBook;"
+      else
+        "participant #{idx} AS #{the_node};"
+      end
+    end)
+  end
+end
+```
+
+```elixir
+# analyze and print
+Sequencer.analyze(events)
+```
