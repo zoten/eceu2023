@@ -27,7 +27,7 @@ Something will be clunkier at the beginning, but we will benefit from it later, 
 
 ## Setup
 
-A basic gotcha of the whole experience is that the `host` part of the `sname` **must** be resolved through the system's resolution system. In our case, since our hostnames will contain the `ratchet` word, let's test it (Linux specific):
+A basic gotcha of the whole experience is that the `host` part of the `sname` **must** be resolved through the system's name resolution. In our case, since our hostnames will contain the `ratchet` word, let's test it (Linux specific):
 
 ```elixir
 "/etc/hosts"
